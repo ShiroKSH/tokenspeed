@@ -44,6 +44,10 @@ from tokenspeed_kernel_amd.ops.attention.gluon.mha_prefill_gfx1250 import (  # n
 )
 from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950 import (  # noqa: F401
     gluon_mla_decode_bf16xbf16_gfx950,
+    gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock,
+    gluon_mla_decode_bf16xbf16_gfx950_bh16bn64,
+    gluon_mla_decode_bf16xbf16_gfx950_bh64,
+    gluon_mla_decode_bf16xbf16_gfx950_bh64_small,
     gluon_mla_decode_bf16xfp8_gfx950,
     gluon_mla_decode_fp8xfp8_gfx950,
 )
