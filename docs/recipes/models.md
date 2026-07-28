@@ -250,6 +250,15 @@ step at bs1 on 8x B300 (~95 -> ~100 tok/s). It engages automatically when
 supported (SM100-family, bf16, NVLS available) and falls back to the fused-AR
 tail otherwise.
 
+When the SiTU sidecar additionally exposes its raw launcher (>=
+0.1.0.post20260726), the tail also fuses the MoE finalize: the sidecar is
+called with the in-op finalize deferred (`do_finalize=False`), and the tail's
+collective performs the top-16 weighted gather over the permuted `gemm2`
+output during its multicast staging pass. This removes the per-layer
+trtllm-gen `finalizeKernel` launch and the rank-local latent's global-memory
+round-trip. Detection is automatic, with fallback to the finalized-latent
+tail.
+
 The checked-in sidecar AOT bundle is a Linux x86_64 development artifact for
 B300/CUDA 13 (`sm103a`) only. On other NVIDIA platforms, fall back to the
 unfused Triton grouped-GEMM MoE backend: skip the sidecar install and

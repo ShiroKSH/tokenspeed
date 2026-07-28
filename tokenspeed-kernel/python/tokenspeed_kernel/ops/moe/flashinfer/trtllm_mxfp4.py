@@ -202,6 +202,34 @@ if platform.is_nvidia:
                 "K3 SiTU sidecar API lacks dev2 EP parameters: " f"{sorted(missing)}"
             )
 
+    def mxfp4_situ_deferred_finalize_supported() -> bool:
+        """Probe whether the SiTU sidecar can skip the in-op MoE finalize.
+
+        Deferred finalize (``do_finalize=False``) goes through the sidecar's
+        raw FFI passthrough, so support is detected from the installed
+        ``tokenspeed_situ`` module rather than configured: the wrapper API
+        pins ``do_finalize=True``, but ``trtllm_fp4_block_scale_moe_raw``
+        exposes the full private launcher ABI.
+
+        Returns:
+            True when the sidecar is importable and exposes the raw FFI
+            entry point plus the enums needed to drive it directly.
+        """
+        if private_situ_runtime_status() is not None:
+            return False
+        try:
+            from tokenspeed_situ import op as situ_op
+        except ImportError:
+            return False
+        return all(
+            hasattr(situ_op, name)
+            for name in (
+                "trtllm_fp4_block_scale_moe_raw",
+                "RoutingInputMode",
+                "ActivationType",
+            )
+        )
+
     def private_situ_runtime_status() -> str | None:
         """Report whether the K3 SiTU sidecar runtime is usable in-process.
 
@@ -493,6 +521,106 @@ if platform.is_nvidia:
         )
         return output
 
+    def _call_mxfp4_situ_routed_moe_deferred(
+        w: torch.nn.Module,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        x: torch.Tensor,
+        enable_pdl: bool,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the SiTU routed MoE with the in-op finalize skipped.
+
+        Uses the sidecar's raw FFI passthrough (the wrapper API pins
+        ``do_finalize=True``) with the same argument marshalling as the
+        finalized path, plus ``do_finalize=False``.
+
+        Args:
+            w: Expert-weight module prepared by the SiTU weight preprocessor.
+            topk_weights: ``[T, top_k]`` routing weights (any float dtype).
+            topk_ids: ``[T, top_k]`` global expert ids.
+            x: ``[T, hidden]`` activations (bf16, or MXFP8 with
+                ``hidden_states_scale``).
+            enable_pdl: Launch the grouped GEMMs with PDL enabled.
+            hidden_states_scale: Optional MXFP8 block scale for the w4a8 chain.
+
+        Returns:
+            The trtllm-gen deferred-finalize triple
+            ``(gemm2_output [P, hidden] bf16 in permuted layout,
+            expert_weights [T, top_k] bf16,
+            expanded_idx_to_permuted_idx [T * top_k] int32, -1 = dropped)``
+            with ``finalize(t) = sum_k expert_weights[t, k] *
+            gemm2_output[expanded_idx_to_permuted_idx[t * top_k + k]]``.
+            ``P`` depends only on ``T`` (CUDA-graph static).
+        """
+        from tokenspeed_situ.op import (
+            ActivationType,
+            RoutingInputMode,
+            trtllm_fp4_block_scale_moe_raw,
+        )
+
+        local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
+        if local_experts != w.w13_weight.shape[0]:
+            raise RuntimeError(
+                f"expected {local_experts} local experts, "
+                f"got {w.w13_weight.shape[0]} weight batches"
+            )
+        local_expert_offset = getattr(w, "ep_rank", 0) * local_experts
+        num_experts = getattr(w, "num_experts")
+        top_k = getattr(w, "top_k")
+        topk_ids_i32 = topk_ids.to(torch.int32).contiguous()
+        topk_weights_bf16 = topk_weights.to(torch.bfloat16).contiguous()
+        # The deferred path leaves `output` unwritten but the FFI still
+        # requires a correctly shaped destination tensor.
+        output = torch.empty(
+            x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
+        )
+        result = trtllm_fp4_block_scale_moe_raw(
+            RoutingInputMode.UNPACKED_PRECOMPUTED,
+            None,  # routing_logits
+            topk_ids_i32,
+            topk_weights_bf16,
+            None,  # routing_bias
+            x,
+            hidden_states_scale,
+            w.w13_weight,
+            w.w13_weight_scale.view(torch.float8_e4m3fn),
+            None,  # gemm1_bias
+            w.gemm1_alpha,
+            w.gemm1_beta,
+            None,  # gemm1_clamp_limit
+            w.w2_weight,
+            w.w2_weight_scale.view(torch.float8_e4m3fn),
+            None,  # gemm2_bias
+            None,  # output1_scale_scalar
+            None,  # output1_scale_gate_scalar
+            None,  # output2_scale_scalar
+            None,  # per_token_scale
+            num_experts,
+            top_k,
+            None,  # n_group
+            None,  # topk_group
+            getattr(w, "intermediate_size_per_partition"),
+            local_expert_offset,
+            local_experts,
+            None,  # routed_scaling_factor
+            0,  # routing_method_type: precomputed routing
+            False,  # do_finalize
+            bool(enable_pdl),
+            ActivationType.SITU,
+            output,
+            [-1, -1],  # tactic: native first-valid
+            True,  # norm_topk_prob: unused for precomputed routing
+            None,  # routing_replay_out
+        )
+        as_torch = lambda v: (
+            v if isinstance(v, torch.Tensor) else torch.from_dlpack(v)
+        )
+        # Deferred result: [gemm2_output, expert_weights (None in unpacked
+        # mode -- the caller-provided weights are authoritative),
+        # expanded_idx_to_permuted_idx].
+        return as_torch(result[0]), topk_weights_bf16, as_torch(result[2])
+
     @register_kernel(
         "moe",
         "apply",
@@ -619,7 +747,13 @@ if platform.is_nvidia:
                 "weight_dtype": frozenset({"mxfp4"}),
                 "activation": frozenset({"situ"}),
                 "routing_mode": frozenset({"precomputed_topk"}),
-                "supports_deferred_finalize": frozenset({False}),
+                # Auto-detected: True requires the sidecar's raw FFI
+                # passthrough (see mxfp4_situ_deferred_finalize_supported).
+                "supports_deferred_finalize": (
+                    frozenset({False, True})
+                    if mxfp4_situ_deferred_finalize_supported()
+                    else frozenset({False})
+                ),
                 "supports_ep": frozenset({True}),
                 "supports_all_to_all_ep": frozenset({False}),
                 "ispp_alignment": frozenset({1}),
@@ -648,8 +782,11 @@ if platform.is_nvidia:
     ):
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
-        if not do_finalize:
-            raise NotImplementedError("FlashInfer MXFP4 SiTU requires finalization")
+        if not do_finalize and not mxfp4_situ_deferred_finalize_supported():
+            raise NotImplementedError(
+                "the installed SiTU sidecar lacks the raw FFI passthrough "
+                "needed for do_finalize=False"
+            )
         if x.dtype != torch.bfloat16:
             raise TypeError("FlashInfer MXFP4 SiTU requires bf16 input")
 
@@ -670,7 +807,13 @@ if platform.is_nvidia:
         hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight_scale.shape[1])
         hidden_original = getattr(w, "hidden_size_original", hidden_padded)
         if x.shape[0] == 0:
-            return x.new_empty(0, hidden_original)
+            if do_finalize:
+                return x.new_empty(0, hidden_original)
+            return (
+                x.new_empty(0, hidden_padded),
+                x.new_empty((0, getattr(w, "top_k")), dtype=torch.bfloat16),
+                x.new_empty((0,), dtype=torch.int32),
+            )
         if x.shape[-1] > hidden_padded:
             raise RuntimeError(
                 f"expected hidden size at most {hidden_padded}, got {x.shape[-1]}"
@@ -688,6 +831,25 @@ if platform.is_nvidia:
             x, x_scale = mxfp8_quantize(x, False, alignment=hidden_padded)
             hidden_states_scale = x_scale.view(torch.float8_e4m3fn).reshape(
                 x.shape[0], -1
+            )
+
+        if not do_finalize:
+            # Deferred finalize: hand back the trtllm-gen finalize inputs so
+            # a downstream consumer (e.g. the K3 latent-tail collective) can
+            # fold the top-k weighted gather into its own load stage.
+            if hidden_original != hidden_padded:
+                raise NotImplementedError(
+                    "deferred finalize returns permuted rows in the padded "
+                    f"hidden space ({hidden_padded}); it cannot slice back to "
+                    f"{hidden_original}"
+                )
+            return _call_mxfp4_situ_routed_moe_deferred(
+                w,
+                topk_weights,
+                topk_ids,
+                x,
+                enable_pdl,
+                hidden_states_scale=hidden_states_scale,
             )
 
         out_buf = getattr(w, "_situ_output_buffer", None)

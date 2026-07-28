@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Specialized from FlashInfer's oneshotAllreduceFusionKernel.
+# The deferred-finalize staging variant (finalize_top_k) follows the
+# finalize_push_norm design of the SGLang project's Kimi-K3 ar_fusion
+# kernels (Apache-2.0): the trtllm-gen deferred MoE finalize (top-k
+# weighted gather over permuted gemm2 rows) is computed in place of the
+# staging load, so the rank-local latent never materializes in gmem.
 
 """Routed AllReduce/RMSNorm with CTA-specialized ReduceScatter early exit."""
 
@@ -104,6 +109,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         fp32_internal: bool = False,
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
+        finalize_top_k: int | None = None,
     ):
         validate_shape(
             tp_size=tp_size,
@@ -114,6 +120,13 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             raise ValueError(f"rank must be in [0,{tp_size}), got {rank}")
         if not include_routed and not include_reduce_scatter:
             raise ValueError("at least one collective role must be enabled")
+        if finalize_top_k is not None and (finalize_top_k <= 0 or finalize_top_k % 8):
+            # idx/weight rows are read as 16B vectors: 4 int32 / 8 bf16 each.
+            raise ValueError(
+                f"finalize_top_k must be a positive multiple of 8, "
+                f"got {finalize_top_k}"
+            )
+        self.finalize_top_k = finalize_top_k
         self.rank = rank
         self.tp_size = tp_size
         self.latent_dim = latent_dim
@@ -168,6 +181,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         shared_workspace: cute.Tensor,
         shared_flags: cute.Tensor,
         shared_peer_ptrs: cute.Tensor,
+        fin_idx: cute.Tensor,
+        fin_weights: cute.Tensor,
         m: Int32,
         epsilon: Float32,
         stream: cuda.CUstream,
@@ -184,6 +199,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             shared_workspace,
             shared_flags,
             shared_peer_ptrs,
+            fin_idx,
+            fin_weights,
             m,
             epsilon,
         ).launch(
@@ -209,6 +226,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         shared_workspace: cute.Tensor,
         shared_flags: cute.Tensor,
         shared_peer_ptrs: cute.Tensor,
+        fin_idx: cute.Tensor,
+        fin_weights: cute.Tensor,
         m: Int32,
         epsilon: Float32,
     ):
@@ -236,6 +255,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 shared_workspace,
                 shared_flags,
                 shared_peer_ptrs,
+                fin_idx,
+                fin_weights,
                 m,
                 epsilon,
                 token,
@@ -261,6 +282,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         shared_workspace: cute.Tensor,
         shared_flags: cute.Tensor,
         shared_peer_ptrs: cute.Tensor,
+        fin_idx: cute.Tensor,
+        fin_weights: cute.Tensor,
         m: Int32,
         epsilon: Float32,
         token: Int32,
@@ -292,15 +315,81 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             )
             dirty_elements = Int64(dirty_index) * (Int64(bytes_per_buffer) // Int64(2))
 
-            local_ptr = cute.make_ptr(
-                BFloat16,
-                (latent_source.iterator + element_offset).llvm_ptr,
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            local_packed = sanitize_negative_zero(
-                load_global_u32x4(local_ptr, volatile=False)
-            )
+            if cutlass.const_expr(self.finalize_top_k is not None):
+                # Deferred MoE finalize as the staging load (design from the
+                # SGLang K3 ar_fusion finalize_push_norm): this fragment of
+                # the rank-local latent is
+                #   sum_k fin_weights[token, k]
+                #         * latent_source[fin_idx[token * K + k], fragment]
+                # with latent_source = gemm2_output in permuted layout and
+                # fin_idx slots of -1 (dropped/non-local) skipped. Every
+                # thread of the token's cluster broadcast-loads the same
+                # K-row routing data (K/4 + K/8 16B vectors from L2).
+                k_top = self.finalize_top_k
+                idx_words = cute.make_rmem_tensor(cute.make_layout((k_top,)), Uint32)
+                for j in cutlass.range_constexpr(k_top // 4):
+                    idx_ptr = cute.make_ptr(
+                        Int32,
+                        (fin_idx.iterator + Int64(token) * k_top + j * 4).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    idx_packed = load_global_u32x4(idx_ptr, volatile=False)
+                    for word in cutlass.range_constexpr(4):
+                        idx_words[j * 4 + word] = idx_packed[word]
+                weight_vals = cute.make_rmem_tensor(cute.make_layout((k_top,)), Float32)
+                for j in cutlass.range_constexpr(k_top // 8):
+                    weight_ptr = cute.make_ptr(
+                        BFloat16,
+                        (fin_weights.iterator + Int64(token) * k_top + j * 8).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    weight_vec = packed_u32x4_to_bf16x8(
+                        load_global_u32x4(weight_ptr, volatile=False)
+                    ).to(Float32)
+                    for lane in cutlass.range_constexpr(8):
+                        weight_vals[j * 8 + lane] = weight_vec[lane]
+                finalize_accum = cute.make_rmem_tensor(
+                    cute.make_layout((VEC_BF16,)), Float32
+                )
+                for element in cutlass.range_constexpr(VEC_BF16):
+                    finalize_accum[element] = Float32(0.0)
+                for k in cutlass.range_constexpr(k_top):
+                    row_word = idx_words[k]
+                    # int32 idx >= 0 <=> u32 msb clear; -1 marks dropped slots
+                    if row_word < Uint32(0x80000000):
+                        row_ptr = cute.make_ptr(
+                            BFloat16,
+                            (
+                                latent_source.iterator
+                                + Int64(row_word) * self.latent_dim
+                                + Int64(packed_idx) * VEC_BF16
+                            ).llvm_ptr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        row_values = packed_u32x4_to_bf16x8(
+                            load_global_u32x4(row_ptr, volatile=False)
+                        ).to(Float32)
+                        for element in cutlass.range_constexpr(VEC_BF16):
+                            finalize_accum[element] = (
+                                finalize_accum[element]
+                                + weight_vals[k] * row_values[element]
+                            )
+                local_packed = sanitize_negative_zero(
+                    bf16x8_to_packed_u32x4(finalize_accum.load().to(BFloat16))
+                )
+            else:
+                local_ptr = cute.make_ptr(
+                    BFloat16,
+                    (latent_source.iterator + element_offset).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                local_packed = sanitize_negative_zero(
+                    load_global_u32x4(local_ptr, volatile=False)
+                )
             multicast_offset = (
                 Int64(current_index) * Int64(bytes_per_buffer)
                 + (
@@ -645,6 +734,7 @@ def _compile_key(
     fp32_internal: bool,
     include_reduce_scatter: bool,
     include_routed: bool,
+    finalize_top_k: int | None = None,
 ):
     return (
         torch.accelerator.current_device_index(),
@@ -657,6 +747,7 @@ def _compile_key(
         fp32_internal,
         include_reduce_scatter,
         include_routed,
+        finalize_top_k,
     )
 
 
@@ -672,6 +763,9 @@ def _runtime_args(
     shared_workspace: torch.Tensor,
     shared_flags: torch.Tensor,
     shared_peer_ptrs: torch.Tensor,
+    fin_idx: torch.Tensor,
+    fin_weights: torch.Tensor,
+    num_tokens: int,
     rms_eps: float,
 ):
     return (
@@ -686,7 +780,11 @@ def _runtime_args(
         to_cute(shared_workspace, 16),
         to_cute(shared_flags, 16),
         to_cute(shared_peer_ptrs, 16),
-        Int32(latent_source.shape[0]),
+        # Flattened so the compiled tensor type carries no static top_k mode
+        # (the plain and finalize variants use different placeholder sizes).
+        to_cute_dynamic_m(fin_idx.reshape(-1), mode=0, assumed_align=16),
+        to_cute_dynamic_m(fin_weights.reshape(-1), mode=0, assumed_align=16),
+        Int32(num_tokens),
         Float32(rms_eps),
         cuda.CUstream(torch.cuda.current_stream(latent_source.device).cuda_stream),
     )
@@ -712,6 +810,7 @@ def compile_kernel(
     fp32_internal: bool,
     include_reduce_scatter: bool = True,
     include_routed: bool = True,
+    finalize_top_k: int | None = None,
 ) -> None:
     """Compile the rank/M specialization without retaining caller tensors."""
 
@@ -725,6 +824,7 @@ def compile_kernel(
         fp32_internal,
         include_reduce_scatter,
         include_routed,
+        finalize_top_k,
     )
     if key in _COMPILED:
         return
@@ -732,6 +832,9 @@ def compile_kernel(
     latent = torch.empty((max_m, latent_dim), dtype=torch.bfloat16, device=device)
     gamma = torch.empty((latent_dim,), dtype=torch.bfloat16, device=device)
     shared = torch.empty((max_m, hidden_dim), dtype=torch.bfloat16, device=device)
+    dummy_k = finalize_top_k if finalize_top_k is not None else 8
+    fin_idx = torch.zeros((max_m * dummy_k,), dtype=torch.int32, device=device)
+    fin_weights = torch.zeros((max_m, dummy_k), dtype=torch.bfloat16, device=device)
     kernel = AllReduceRMSNormWithReduceScatterEarlyExit(
         rank=rank,
         tp_size=tp_size,
@@ -742,6 +845,7 @@ def compile_kernel(
         fp32_internal=fp32_internal,
         include_reduce_scatter=include_reduce_scatter,
         include_routed=include_routed,
+        finalize_top_k=finalize_top_k,
     )
     _COMPILED[key] = cute.compile(
         kernel,
@@ -757,6 +861,9 @@ def compile_kernel(
             shared_workspace,
             shared_flags,
             shared_peer_ptrs,
+            fin_idx,
+            fin_weights,
+            max_m,
             rms_eps,
         ),
     )
@@ -774,6 +881,9 @@ def launch(
     shared_workspace: torch.Tensor,
     shared_flags: torch.Tensor,
     shared_peer_ptrs: torch.Tensor,
+    fin_idx: torch.Tensor,
+    fin_weights: torch.Tensor,
+    num_tokens: int,
     rms_eps: float,
     *,
     rank: int,
@@ -785,6 +895,7 @@ def launch(
     fp32_internal: bool,
     include_reduce_scatter: bool = True,
     include_routed: bool = True,
+    finalize_top_k: int | None = None,
 ) -> None:
     compile_kernel(
         rank=rank,
@@ -805,6 +916,7 @@ def launch(
         fp32_internal=fp32_internal,
         include_reduce_scatter=include_reduce_scatter,
         include_routed=include_routed,
+        finalize_top_k=finalize_top_k,
     )
     _COMPILED[
         _compile_key(
@@ -817,6 +929,7 @@ def launch(
             fp32_internal,
             include_reduce_scatter,
             include_routed,
+            finalize_top_k,
         )
     ](
         *_runtime_args(
@@ -831,6 +944,9 @@ def launch(
             shared_workspace,
             shared_flags,
             shared_peer_ptrs,
+            fin_idx,
+            fin_weights,
+            num_tokens,
             rms_eps,
         )
     )
@@ -851,6 +967,7 @@ class CollectiveKernel:
         max_token_ctas: int,
         rms_eps: float,
         fp32_internal: bool,
+        finalize_top_k: int | None = None,
     ) -> None:
         validate_shape(
             tp_size=tp_size,
@@ -866,6 +983,7 @@ class CollectiveKernel:
         self.max_token_ctas = max_token_ctas
         self.rms_eps = float(rms_eps)
         self.fp32_internal = fp32_internal
+        self.finalize_top_k = finalize_top_k
         device = torch.device("cuda", torch.accelerator.current_device_index())
 
         bytes_per_routed_buffer = max_m * tp_size * latent_dim * 2
@@ -926,28 +1044,43 @@ class CollectiveKernel:
             peer_ptrs, dtype=torch.int64, device=device
         )
 
+        # Placeholder finalize inputs for the plain (non-finalize) launch:
+        # the compiled signature always carries the two tensors.
+        dummy_k = finalize_top_k if finalize_top_k is not None else 8
+        self._fin_idx_dummy = torch.zeros(
+            (max_m * dummy_k,), dtype=torch.int32, device=device
+        )
+        self._fin_weights_dummy = torch.zeros(
+            (max_m, dummy_k), dtype=torch.bfloat16, device=device
+        )
+
         torch.accelerator.synchronize(device)
         dist.barrier(group=group, device_ids=[device.index])
+        # The finalize variant is compiled IN ADDITION to the plain one so
+        # callers keep an automatic fallback to the finalized-latent path.
+        variants = [None] if finalize_top_k is None else [None, finalize_top_k]
         for owner in range(tp_size):
             if rank == owner:
-                compile_kernel(
-                    rank=rank,
-                    tp_size=tp_size,
-                    latent_dim=latent_dim,
-                    hidden_dim=hidden_dim,
-                    max_m=max_m,
-                    max_token_ctas=max_token_ctas,
-                    latent_output=self._latent_output,
-                    routed_workspace=self._routed_workspace,
-                    routed_flags=self._routed_flags,
-                    routed_multicast_ptr=self._routed_multicast_ptr,
-                    shared_output=self._shared_output,
-                    shared_workspace=self._shared_workspace,
-                    shared_flags=self._shared_flags,
-                    shared_peer_ptrs=self._shared_peer_ptrs,
-                    rms_eps=self.rms_eps,
-                    fp32_internal=fp32_internal,
-                )
+                for variant in variants:
+                    compile_kernel(
+                        rank=rank,
+                        tp_size=tp_size,
+                        latent_dim=latent_dim,
+                        hidden_dim=hidden_dim,
+                        max_m=max_m,
+                        max_token_ctas=max_token_ctas,
+                        latent_output=self._latent_output,
+                        routed_workspace=self._routed_workspace,
+                        routed_flags=self._routed_flags,
+                        routed_multicast_ptr=self._routed_multicast_ptr,
+                        shared_output=self._shared_output,
+                        shared_workspace=self._shared_workspace,
+                        shared_flags=self._shared_flags,
+                        shared_peer_ptrs=self._shared_peer_ptrs,
+                        rms_eps=self.rms_eps,
+                        fp32_internal=fp32_internal,
+                        finalize_top_k=variant,
+                    )
             dist.barrier(group=group, device_ids=[device.index])
 
     def __call__(
@@ -955,24 +1088,81 @@ class CollectiveKernel:
         latent_source: torch.Tensor,
         shared_source: torch.Tensor,
         gamma: torch.Tensor,
+        *,
+        fin_idx: torch.Tensor | None = None,
+        fin_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Launch the collective; two ``latent_source`` interpretations.
+
+        Plain mode (``fin_idx``/``fin_weights`` omitted): ``latent_source``
+        is this rank's finalized latent partial ``[M, latent_dim]``.
+
+        Finalize mode (both given; requires ``finalize_top_k``):
+        ``latent_source`` is the trtllm-gen deferred-finalize
+        ``gemm2_output`` ``[P, latent_dim]`` in permuted layout, ``fin_idx``
+        is ``expanded_idx_to_permuted_idx`` ``[M * top_k]`` int32 (-1 =
+        dropped slot) and ``fin_weights`` is ``[M, top_k]`` bf16; the rank
+        partial ``sum_k fin_weights[t, k] * gemm2[fin_idx[t * top_k + k]]``
+        is computed during multicast staging and never written to gmem.
+        """
+        finalize = fin_idx is not None or fin_weights is not None
+        if finalize and (fin_idx is None or fin_weights is None):
+            raise ValueError("fin_idx and fin_weights must be given together")
+        if finalize and self.finalize_top_k is None:
+            raise ValueError("this CollectiveKernel was built without finalize_top_k")
         if latent_source.ndim != 2 or shared_source.ndim != 2:
             raise ValueError("latent_source and shared_source must be rank-2")
-        m = latent_source.shape[0]
+        m = shared_source.shape[0]
         device = self._routed_workspace.device
-        expected = (
-            (latent_source, (m, self.latent_dim), "latent_source"),
-            (shared_source, (m, self.hidden_dim), "shared_source"),
-            (gamma, (self.latent_dim,), "gamma"),
-        )
-        for tensor, shape, name in expected:
+        if finalize:
+            k_top = self.finalize_top_k
+            expected = (
+                (fin_weights, (m, k_top), torch.bfloat16, "fin_weights"),
+                (fin_idx, (m * k_top,), torch.int32, "fin_idx"),
+                (gamma, (self.latent_dim,), torch.bfloat16, "gamma"),
+                (
+                    shared_source,
+                    (m, self.hidden_dim),
+                    torch.bfloat16,
+                    "shared_source",
+                ),
+            )
+            if (
+                latent_source.shape[1] != self.latent_dim
+                or latent_source.dtype != torch.bfloat16
+                or latent_source.device != device
+                or not latent_source.is_contiguous()
+            ):
+                raise ValueError(
+                    "latent_source (gemm2_output) must be contiguous CUDA "
+                    f"BF16 [*, {self.latent_dim}]"
+                )
+        else:
+            expected = (
+                (
+                    latent_source,
+                    (m, self.latent_dim),
+                    torch.bfloat16,
+                    "latent_source",
+                ),
+                (
+                    shared_source,
+                    (m, self.hidden_dim),
+                    torch.bfloat16,
+                    "shared_source",
+                ),
+                (gamma, (self.latent_dim,), torch.bfloat16, "gamma"),
+            )
+        for tensor, shape, dtype, name in expected:
             if (
                 tensor.shape != shape
-                or tensor.dtype != torch.bfloat16
+                or tensor.dtype != dtype
                 or tensor.device != device
                 or not tensor.is_contiguous()
             ):
-                raise ValueError(f"{name} must be contiguous CUDA BF16 {list(shape)}")
+                raise ValueError(
+                    f"{name} must be contiguous CUDA {dtype} {list(shape)}"
+                )
         if not 1 <= m <= self.max_m:
             raise ValueError(f"runtime M={m} must be in [1, {self.max_m}]")
 
@@ -989,6 +1179,9 @@ class CollectiveKernel:
                 self._shared_workspace,
                 self._shared_flags,
                 self._shared_peer_ptrs,
+                fin_idx if finalize else self._fin_idx_dummy,
+                fin_weights if finalize else self._fin_weights_dummy,
+                m,
                 self.rms_eps,
                 rank=self.rank,
                 tp_size=self.tp_size,
@@ -997,6 +1190,7 @@ class CollectiveKernel:
                 max_m=self.max_m,
                 max_token_ctas=self.max_token_ctas,
                 fp32_internal=self.fp32_internal,
+                finalize_top_k=self.finalize_top_k if finalize else None,
             )
         return (
             self._latent_output[:m],
