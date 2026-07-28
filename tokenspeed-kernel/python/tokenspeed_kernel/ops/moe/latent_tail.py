@@ -85,7 +85,6 @@ class _Contract:
     hidden_size: int
     latent_size: int
     rms_eps: float
-    finalize_top_k: int | None
 
 
 class KimiK3LatentTailOp:
@@ -107,25 +106,7 @@ class KimiK3LatentTailOp:
         latent_size: int,
         rms_eps: float,
         device: torch.device,
-        finalize_top_k: int | None = None,
     ) -> "KimiK3LatentTailOp":
-        """Get or build the tail op for one contract (collective rendezvous).
-
-        Args:
-            group: Tensor-parallel process group (every rank constructs in
-                lockstep with identical arguments).
-            hidden_size: Model hidden size (7168 for K3).
-            latent_size: Routed-expert latent width (3584 for K3).
-            rms_eps: Latent RMSNorm epsilon.
-            device: This rank's CUDA device.
-            finalize_top_k: When set (K3: 16), additionally compile the
-                deferred-finalize collective variant so :meth:`deferred` can
-                consume the sidecar's ``do_finalize=False`` triple directly;
-                the plain :meth:`__call__` path stays available as fallback.
-
-        Returns:
-            The process-wide op instance for the contract.
-        """
         contract = _Contract(
             group_id=id(group),
             tp_size=dist.get_world_size(group),
@@ -133,7 +114,6 @@ class KimiK3LatentTailOp:
             hidden_size=hidden_size,
             latent_size=latent_size,
             rms_eps=float(rms_eps),
-            finalize_top_k=finalize_top_k,
         )
         op = cls._instances.get(contract)
         if op is None:
@@ -161,7 +141,6 @@ class KimiK3LatentTailOp:
                 max_token_ctas=_COLLECTIVE_TOKEN_CTAS,
                 rms_eps=contract.rms_eps,
                 fp32_internal=False,
-                finalize_top_k=contract.finalize_top_k,
             )
             self._up_projection = AdaptiveUpProjectionKernel(
                 group=group,
@@ -185,62 +164,6 @@ class KimiK3LatentTailOp:
     @property
     def max_num_tokens(self) -> int:
         return _MAX_NUM_TOKENS
-
-    @property
-    def supports_deferred_finalize(self) -> bool:
-        """True when :meth:`deferred` is available (built with a top_k)."""
-        return self.contract.finalize_top_k is not None
-
-    def _finish(
-        self,
-        latent: torch.Tensor,
-        shared_shard: torch.Tensor,
-        up_weight: torch.Tensor,
-        m: int,
-    ) -> torch.Tensor:
-        local_hidden = self.contract.hidden_size // self.contract.tp_size
-        local_up_weight = up_weight.narrow(0, self.rank * local_hidden, local_hidden)
-        mailbox = self._up_projection(latent, local_up_weight, shared_shard)
-        return self._lamport_copy(mailbox, m=m).squeeze(0)
-
-    def deferred(
-        self,
-        gemm2_out: torch.Tensor,
-        expanded_idx: torch.Tensor,
-        expert_weights: torch.Tensor,
-        shared_partial: torch.Tensor,
-        rms_weight: torch.Tensor,
-        up_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        """Fused tail consuming the sidecar's deferred-finalize triple.
-
-        The collective's staging pass performs the top-k weighted gather
-        itself, so the rank-local finalized latent (and the trtllm-gen
-        finalizeKernel that would produce it) is eliminated.
-
-        Args:
-            gemm2_out: Deferred ``gemm2_output`` ``[P, 3584]`` bf16 in
-                permuted layout (``P`` is CUDA-graph static for fixed M).
-            expanded_idx: ``expanded_idx_to_permuted_idx`` ``[M * top_k]``
-                int32; ``-1`` marks dropped slots.
-            expert_weights: ``[M, top_k]`` bf16 routing weights.
-            shared_partial: This rank's shared-expert partial ``[M, 7168]``.
-            rms_weight: Latent RMSNorm weight ``[3584]``.
-            up_weight: Replicated up-projection weight ``[7168, 3584]``.
-
-        Returns:
-            ``[M, 7168]`` post-communication hidden (up-projection + shared).
-        """
-        m = shared_partial.shape[0]
-        self._up_projection.ensure_compiled(m)
-        latent, shared_shard = self._collective(
-            gemm2_out,
-            shared_partial,
-            rms_weight,
-            fin_idx=expanded_idx,
-            fin_weights=expert_weights,
-        )
-        return self._finish(latent, shared_shard, up_weight, m)
 
     def __call__(
         self,
@@ -270,7 +193,10 @@ class KimiK3LatentTailOp:
             shared_partial,
             rms_weight,
         )
-        return self._finish(latent, shared_shard, up_weight, m)
+        local_hidden = self.contract.hidden_size // self.contract.tp_size
+        local_up_weight = up_weight.narrow(0, self.rank * local_hidden, local_hidden)
+        mailbox = self._up_projection(latent, local_up_weight, shared_shard)
+        return self._lamport_copy(mailbox, m=m).squeeze(0)
 
 
 __all__ = ["KimiK3LatentTailOp", "latent_tail_supported"]

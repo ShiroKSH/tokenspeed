@@ -69,11 +69,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
-from tokenspeed_kernel.ops.attn_res import (
-    attn_res_fwd,
-    attn_res_fwd_v2,
-    attn_res_fwd_v2_cuda_available,
-)
+from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection_add3,
@@ -1149,19 +1145,6 @@ class KimiLinearMoE(nn.Module):
                 latent_size=self.routed_hidden,
                 dtype=torch.bfloat16,
             ):
-                # Finalize fusion: when the SiTU sidecar can defer the
-                # trtllm-gen MoE finalize, the tail collective performs the
-                # top-16 weighted gather itself (auto-detected; the plain
-                # finalized-latent tail stays compiled as fallback).
-                tail_finalize_top_k = (
-                    self.top_k
-                    if (
-                        self.use_trtllm_situ_moe
-                        and self.top_k == 16
-                        and getattr(self.experts, "supports_deferred_finalize", False)
-                    )
-                    else None
-                )
                 try:
                     self._latent_tail = KimiK3LatentTailOp.initialize(
                         group=torch.distributed.group.WORLD,
@@ -1169,7 +1152,6 @@ class KimiLinearMoE(nn.Module):
                         latent_size=self.routed_hidden,
                         rms_eps=self.routed_expert_norm.variance_epsilon,
                         device=torch.device("cuda", torch.cuda.current_device()),
-                        finalize_top_k=tail_finalize_top_k,
                     )
                 except Exception:  # noqa: BLE001 - keep the fused-AR tail
                     logger.exception("multicast latent tail unavailable; falling back")
@@ -1182,27 +1164,14 @@ class KimiLinearMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         skip_reduce: bool = False,
-        do_finalize: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run fused sidecar-backed TRT-LLM SiTU or the Triton fallback.
-
-        ``do_finalize=False`` (SiTU sidecar only, pre-reduce consumers only)
-        returns the deferred trtllm-gen finalize triple ``(gemm2_out,
-        expert_weights, expanded_idx_to_permuted_idx)`` instead of the
-        finalized latent partial.
-        """
-        if not do_finalize and not (self.use_trtllm_situ_moe and skip_reduce):
-            raise ValueError(
-                "do_finalize=False requires the SiTU sidecar and a "
-                "pre-reduce consumer"
-            )
+        """Run fused sidecar-backed TRT-LLM SiTU or the Triton fallback."""
         if self.use_trtllm_situ_moe:
             out = self.experts(
                 hidden_states=routed_in,
                 topk_output=topk_output,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                do_finalize=do_finalize,
             )
             # Each TP rank owns an intermediate shard; each EP rank owns a
             # contiguous expert shard. The routed kernel returns that rank's
@@ -1242,20 +1211,11 @@ class KimiLinearMoE(nn.Module):
         prefix_sum: torch.Tensor,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-        defer_accumulate: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         """Routed + shared experts, accumulated onto ``prefix_sum``.
 
         Returns the new prefix (``prefix_sum + routed + shared``); at bs=1
         the up-projection's store performs the accumulate in-kernel.
-
-        With ``defer_accumulate=True`` (single-kernel AttnRes arrangement) the
-        return is ``(prefix, delta)`` instead: a path that would materialize a
-        standalone eager add hands the unsummed FFN output back as ``delta``
-        for the next AttnRes mix to fold in as its fused-delta operand, while
-        paths whose accumulate already rides another kernel (``add3``, the
-        up-projection epilogue) still return the summed prefix with
-        ``delta=None``.
         """
         if self.native_latent_moe is not None:
             routed_out, shared_out = self.native_latent_moe(
@@ -1263,12 +1223,11 @@ class KimiLinearMoE(nn.Module):
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             )
-            new_prefix = add3(prefix_sum, routed_out, shared_out)
-            return (new_prefix, None) if defer_accumulate else new_prefix
+            return add3(prefix_sum, routed_out, shared_out)
 
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens == 0:
-            return (prefix_sum, None) if defer_accumulate else prefix_sum
+            return prefix_sum
 
         # Router runs uncontended on main (3us; on aux it starves to 14us
         # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
@@ -1281,9 +1240,6 @@ class KimiLinearMoE(nn.Module):
             and get_is_cuda_graph_phase()
             and 1 <= num_tokens <= self._latent_tail.max_num_tokens
         )
-        # Finalize fusion: skip the trtllm-gen finalizeKernel and let the
-        # tail's collective compute the top-16 gather during staging.
-        use_deferred_tail = use_tail and self._latent_tail.supports_deferred_finalize
         lane = allreduce_fusion_lane(
             hidden_states,
             self.routed_hidden + hidden_size,
@@ -1313,7 +1269,6 @@ class KimiLinearMoE(nn.Module):
                 num_global_tokens,
                 max_num_tokens_per_gpu,
                 skip_reduce=self.execution_plan.fused_moe_ar or use_tail,
-                do_finalize=not use_deferred_tail,
             )
             if not (self.execution_plan.fused_moe_ar or use_tail):
                 if self.routed_expert_norm is not None:
@@ -1321,26 +1276,12 @@ class KimiLinearMoE(nn.Module):
                 routed_out = self.routed_expert_up_proj(routed_out)[0]
         if use_tail:
             # Both partials stay pre-reduce; the tail owns all communication.
-            if use_deferred_tail:
-                gemm2_out, expert_weights, expanded_idx = routed_out
-                tail_out = self._latent_tail.deferred(
-                    gemm2_out,
-                    expanded_idx,
-                    expert_weights,
-                    shared_partial,
-                    self.routed_expert_norm.weight,
-                    self.routed_expert_up_proj.weight,
-                )
-            else:
-                tail_out = self._latent_tail(
-                    routed_out,
-                    shared_partial,
-                    self.routed_expert_norm.weight,
-                    self.routed_expert_up_proj.weight,
-                )
-            if defer_accumulate:
-                # The standalone add becomes the next mix's fused delta.
-                return prefix_sum, tail_out
+            tail_out = self._latent_tail(
+                routed_out,
+                shared_partial,
+                self.routed_expert_norm.weight,
+                self.routed_expert_up_proj.weight,
+            )
             return prefix_sum + tail_out
         if self.execution_plan.fused_moe_ar:
             # Post-join: one [T, latent+hidden] all-reduce covers both
@@ -1357,23 +1298,21 @@ class KimiLinearMoE(nn.Module):
                 enable_lane_norm=self.execution_plan.lane_latent_norm_ar,
                 max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
             )
-            new_prefix = kimi3_latent_projection_add3(
+            return kimi3_latent_projection_add3(
                 routed_out,
                 self.routed_expert_up_proj.weight,
                 prefix_sum,
                 shared_out,
             ).view(num_tokens, hidden_size)
-            return (new_prefix, None) if defer_accumulate else new_prefix
         else:
             shared_out = self._reduce_shared(shared_partial)
         # routed_scaling_factor already applied in TopK; not re-applied here
         # (matches the reference).
-        new_prefix = add3(
+        return add3(
             prefix_sum,
             routed_out.view(num_tokens, hidden_size),
             shared_out.view(num_tokens, hidden_size),
         )
-        return (new_prefix, None) if defer_accumulate else new_prefix
 
     def _reduce_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:
         """Reduce the shared experts' TP partial on the current (default) stream."""
@@ -1388,21 +1327,10 @@ class KimiLinearDecoderLayer(nn.Module):
     One class for both layer types — the AttnRes data flow is identical, only
     ``self_attn`` differs (dispatched by ``config.is_kda_layer(layer_id)``). The
     AttnRes path replaces the plain pre-norm residual with a
-    learned block-residual mixing and runs *outside* ``CommManager`` fusion:
-    attention/FFN output projections all-reduce in place
+    learned block-residual mixing (``_apply_attn_res``) and runs *outside*
+    ``CommManager`` fusion: attention/FFN output projections all-reduce in place
     (``reduce_results=True``) and the residual is threaded explicitly as the
     per-token ``block_residual`` buffer.
-
-    Two AttnRes arrangements exist, chosen by the backbone's capability probe:
-
-    * **single-kernel** (``_attnres_v2``, SM100 + H=7168): each mix is one
-      warp-specialized ``attn_res_fwd_v2`` launch on the main stream with PDL;
-      the attention AR stays plain and its residual accumulate rides the
-      mlp-side mix as a fused delta.
-    * **split/dual** (fallback): a blocks-only partial precomputes on the aux
-      stream under attention (``attnres_partial_dual``), the mlp-side combine
-      rides the AR epilogue, and the attn-side combine folds the prefix
-      candidate standalone.
     """
 
     def __init__(
@@ -1531,12 +1459,6 @@ class KimiLinearDecoderLayer(nn.Module):
         self._mlp_wp = None
         # True when the PREVIOUS layer precomputes our attn-side block partial.
         self._attn_split = False
-        # True when the single-kernel AttnRes arrangement is armed (set by the
-        # backbone after probing the fwd_v2 CUDA capability): both mixes run
-        # standalone on the main stream with PDL, the attention AR stays plain
-        # (its residual accumulate rides the mlp-side mix as a fused delta),
-        # and no aux-stream partial is launched.
-        self._attnres_v2 = False
         # True when the NEXT layer folds our routed+shared residual accumulate
         # into its attn-side combine (we return the parts unsummed).
         self.comm_manager = CommManager(
@@ -1603,28 +1525,14 @@ class KimiLinearDecoderLayer(nn.Module):
         return (reduced if prefix_sum is None else prefix_sum + reduced), None
 
     def _mix_into_attention(
-        self,
-        hidden_states: torch.Tensor,
-        block_residual: torch.Tensor,
-        pending_delta: torch.Tensor | None = None,
+        self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """AttnRes entry: mix the residual candidates into the attention input.
-
-        ``pending_delta`` is the previous layer's deferred FFN accumulate
-        (single-kernel arrangement only); the v2 mix folds it in as its fused
-        delta, updating ``prefix_sum`` in place BEFORE the block-write snapshot
-        below copies it, so the snapshot sees the accumulated stream.
 
         Returns ``(h, prefix_sum)`` -- with ``prefix_sum`` None at block-write
         layers (the snapshot consumed it).
         """
         prefix_sum = hidden_states
-        v2_mix = self._attnres_v2 and self.prev_valid_blocks > 0
-        if pending_delta is not None and not v2_mix:
-            # No v2 mix here to fold it (layer 0 / shape fallback safety):
-            # materialize the deferred accumulate eagerly.
-            prefix_sum = prefix_sum + pending_delta
-            pending_delta = None
         n_tok = prefix_sum.shape[0]
         fast_mix = (
             self._attn_split
@@ -1632,21 +1540,7 @@ class KimiLinearDecoderLayer(nn.Module):
             and prefix_sum.is_cuda
             and self.prev_valid_blocks > 0
         )
-        if v2_mix:
-            # Single-kernel arrangement: one warp-specialized full mix with the
-            # input_layernorm fused, PDL-chained on the main stream.
-            h = attn_res_fwd_v2(
-                prefix_sum,
-                pending_delta,
-                block_residual[: self.prev_valid_blocks],
-                self.self_attention_res_proj.weight.reshape(-1),
-                self.self_attention_res_norm.weight,
-                self.input_layernorm.weight,
-                self.self_attention_res_norm.variance_epsilon,
-                self.input_layernorm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
-            )
-        elif fast_mix:
+        if fast_mix:
             # The block partial was precomputed on the previous layer's aux
             # stream; only the prefix candidate is folded here.
             h = attnres_combine(
@@ -1679,59 +1573,14 @@ class KimiLinearDecoderLayer(nn.Module):
         ctx: "ForwardContext",
         out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
-        pending_delta: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        """Returns ``(prefix_sum, pending_delta, block_residual)``.
-
-        ``pending_delta`` carries this layer's deferred FFN accumulate to the
-        next layer's attn-side mix (single-kernel AttnRes arrangement only;
-        always None on the split/dual fallback).
-        """
-        h, prefix_sum = self._mix_into_attention(
-            hidden_states, block_residual, pending_delta
-        )
-        mlp_valid_blocks = self.prev_valid_blocks + (
-            1 if self.is_block_write_layer else 0
-        )
-        if self._attnres_v2:
-            # Single-kernel arrangement: plain attention all-reduce, then one
-            # full mix with the residual accumulate fused as its delta and the
-            # post_attention_layernorm fused into its epilogue. No aux-stream
-            # partial and no AR epilogue, so the AR runs its cheapest pattern.
-            attn_out = self.self_attn(
-                positions=positions,
-                hidden_states=h,
-                ctx=ctx,
-                out_cache_loc=out_cache_loc,
-                comm_manager=self.comm_manager,
-            )
-            reduced, _ = self._reduce_attn_accumulate(attn_out, None)
-            if prefix_sum is None:
-                # Block-write layer: the stream restarts at the attention
-                # output (the snapshot above consumed the previous prefix).
-                prefix_sum, delta = reduced, None
-            else:
-                delta = reduced  # prefix_sum += delta fuses into the mix
-            h = attn_res_fwd_v2(
-                prefix_sum,
-                delta,
-                block_residual[:mlp_valid_blocks],
-                self.mlp_res_proj.weight.reshape(-1),
-                self.mlp_res_norm.weight,
-                self.post_attention_layernorm.weight,
-                self.mlp_res_norm.variance_epsilon,
-                self.post_attention_layernorm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
-            )
-            # Defer the FFN accumulate: the next layer's attn-side mix (or the
-            # final model-level mix) folds it in as its fused delta.
-            prefix_sum, next_delta = self._accumulate_ffn(
-                h, prefix_sum, ctx, defer=True
-            )
-            return prefix_sum, next_delta, block_residual
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h, prefix_sum = self._mix_into_attention(hidden_states, block_residual)
         # The mlp-side mixing's block partial hides under attention on the aux
         # stream (blocks are final for this layer once the snapshot above ran);
         # the combine after the attention AR only touches the prefix candidate.
+        mlp_valid_blocks = self.prev_valid_blocks + (
+            1 if self.is_block_write_layer else 0
+        )
         num_tokens = h.shape[0]
         split_mix = (
             0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
@@ -1806,49 +1655,19 @@ class KimiLinearDecoderLayer(nn.Module):
                 mlp_valid_blocks,
                 out_norm=self.post_attention_layernorm,
             )
-        prefix_sum, _ = self._accumulate_ffn(h, prefix_sum, ctx)
-        return prefix_sum, None, block_residual
-
-    def _accumulate_ffn(
-        self,
-        h: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        ctx: "ForwardContext",
-        defer: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """FFN on the mixed hidden; accumulate its output onto the stream.
-
-        Returns ``(prefix_sum, pending_delta)``. With ``defer=False`` the
-        accumulate is always materialized and ``pending_delta`` is None. With
-        ``defer=True`` (single-kernel AttnRes arrangement) an FFN output that
-        would otherwise need a standalone eager add comes back as
-        ``pending_delta`` for the NEXT AttnRes mix to fold in as its fused
-        delta; FFN paths whose accumulate already rides another kernel still
-        return the summed prefix with ``pending_delta=None``.
-        """
         if self.is_moe_layer:
             num_global_tokens, max_num_tokens_per_gpu = (
                 self.comm_manager.get_num_tokens(ctx)
             )
-            if defer:
-                return self.block_sparse_moe(
-                    h,
-                    prefix_sum,
-                    num_global_tokens=num_global_tokens,
-                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                    defer_accumulate=True,
-                )
-            new_prefix = self.block_sparse_moe(
+            prefix_sum = self.block_sparse_moe(
                 h,
                 prefix_sum,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             )
-            return new_prefix, None
-        ffn_out = self.mlp(h)
-        if defer:
-            return prefix_sum, ffn_out
-        return prefix_sum + ffn_out, None
+        else:
+            prefix_sum = prefix_sum + self.mlp(h)
+        return prefix_sum, block_residual
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1904,33 +1723,18 @@ class KimiLinearModel(nn.Module):
             get_layer,
             prefix=add_prefix("layers", prefix),
         )
-        # AttnRes arrangement, chosen by capability probe. Preferred: the
-        # single-kernel post-AR arrangement (SM100 warp-specialized fwd_v2
-        # covering every mix shape of this model) -- both per-layer mixes run
-        # standalone on the main stream with PDL and the attention AR stays
-        # plain. Fallback: the split/dual design, where a layer's aux stream
-        # precomputes the NEXT layer's block partial alongside its own
-        # mlp-side partial (one dual sweep under attention; blocks are final
-        # by then) and the mlp-side combine rides the AR epilogue.
-        num_blocks_total = ceil_div(
-            config.num_hidden_layers, config.attn_res_block_size
-        )
-        self._attnres_v2 = attn_res_fwd_v2_cuda_available(
-            config.hidden_size, num_blocks_total
-        )
-        if self._attnres_v2:
-            for layer in self.layers:
-                layer._attnres_v2 = True
-        else:
-            for i in range(len(self.layers) - 1):
-                cur, nxt = self.layers[i], self.layers[i + 1]
-                if nxt.prev_valid_blocks > 0:
-                    assert (
-                        cur.mlp_res_norm.variance_epsilon
-                        == nxt.self_attention_res_norm.variance_epsilon
-                    ), "dual partial assumes one shared RMS epsilon"
-                    cur._next_attn_mix = (nxt, nxt.prev_valid_blocks)
-                    nxt._attn_split = True
+        # Cross-layer attn-side mix precompute: a layer's aux stream computes
+        # the NEXT layer's block partial alongside its own mlp-side partial
+        # (one dual sweep under attention; blocks are final by then).
+        for i in range(len(self.layers) - 1):
+            cur, nxt = self.layers[i], self.layers[i + 1]
+            if nxt.prev_valid_blocks > 0:
+                assert (
+                    cur.mlp_res_norm.variance_epsilon
+                    == nxt.self_attention_res_norm.variance_epsilon
+                ), "dual partial assumes one shared RMS epsilon"
+                cur._next_attn_mix = (nxt, nxt.prev_valid_blocks)
+                nxt._attn_split = True
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -1972,45 +1776,19 @@ class KimiLinearModel(nn.Module):
         )
 
         prefix_sum = hidden_states
-        # Deferred FFN accumulate chain (single-kernel AttnRes arrangement):
-        # each layer's eager residual add is carried as pending_delta and
-        # folded into the next mix as its fused delta; the final model-level
-        # mix consumes the last one.
-        pending_delta = None
         for layer in self.layers:
-            prefix_sum, pending_delta, block_residual = layer(
-                positions,
-                prefix_sum,
-                ctx,
-                out_cache_loc,
-                block_residual,
-                pending_delta,
+            prefix_sum, block_residual = layer(
+                positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
 
-        if self._attnres_v2 and num_blocks > 0:
-            hidden_states = attn_res_fwd_v2(
-                prefix_sum,
-                pending_delta,
-                block_residual,
-                self.output_attn_res_proj.weight.reshape(-1),
-                self.output_attn_res_norm.weight,
-                self.norm.weight,
-                self.output_attn_res_norm.variance_epsilon,
-                self.norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
-            )
-        else:
-            if pending_delta is not None:
-                # Shape-fallback safety; the split arrangement never defers.
-                prefix_sum = prefix_sum + pending_delta
-            hidden_states = _apply_attn_res(
-                prefix_sum,
-                block_residual,
-                self.output_attn_res_proj,
-                self.output_attn_res_norm,
-                num_blocks,
-                out_norm=self.norm,
-            )
+        hidden_states = _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            self.output_attn_res_proj,
+            self.output_attn_res_norm,
+            num_blocks,
+            out_norm=self.norm,
+        )
         return hidden_states, None
 
 

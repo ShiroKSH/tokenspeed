@@ -430,7 +430,6 @@ KERNEL_GROUPS = [
         [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
-            CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
             CUDA_CSRC_DIR / "minimax_reduce_rms.cu",
@@ -441,9 +440,7 @@ KERNEL_GROUPS = [
         "attn_res",
         [
             CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_tma.cu",
-            CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_online_v2.cu",
             CUDA_CSRC_DIR / "attn_res_binding.cu",
-            CUDA_CSRC_DIR / "attn_res_v2_binding.cu",
         ],
         [],
     ),
