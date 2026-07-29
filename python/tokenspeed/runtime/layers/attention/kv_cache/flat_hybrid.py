@@ -940,33 +940,6 @@ class FlatHybridCachePool:
             view[loc.long(), :, :nope_dim] = cache_k_nope
             view[loc.long(), :, nope_dim:] = cache_k_rope
 
-    def mla_fp8_commit_view(
-        self, layer: object, loc: torch.Tensor
-    ) -> torch.Tensor | None:
-        """Flat fp8 latent view for a fused query-quant + KV-commit kernel.
-
-        ``mla_nope_query_kv_fp8`` folds the ``set_mla_kv_buffer`` write into
-        the query fp8-assembly launch, so it needs the raw per-layer view
-        instead of the write API. Location checks match ``set_mla_kv_buffer``.
-
-        Args:
-            layer: Attention layer (only ``layer.layer_id`` is consulted).
-            loc: 1-D int tensor of absolute token locations.
-
-        Returns:
-            The ``[num_rows, 1, kv_lora_rank + qk_rope_head_dim]`` fp8 view, or
-            None when a plain cast-store would not match the write path's
-            semantics (caller keeps the two-kernel path).
-        """
-        try:
-            view = self._require_mla_flat_view(int(layer.layer_id))
-        except KeyError:  # non-MLA layer (e.g. a KDA layer in a hybrid model)
-            return None
-        if view.dtype != torch.float8_e4m3fn or view.device.type != "cuda":
-            return None
-        self._check_mla_locations(loc, "mla_fp8_commit_view")
-        return view
-
     def get_mla_kv_buffer(
         self,
         layer: object,

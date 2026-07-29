@@ -900,21 +900,16 @@ class DeepseekV3AttentionMLA(nn.Module):
             and q_nope.size(0) > 0
         ):
             # NoPE + fp8: assemble the query straight into fp8; the KV write casts the bf16 latents in-kernel.
-            # When the pool can hand out its flat fp8 view, the KV commit
-            # rides the same launch (the pair is launch-latency bound at
-            # decode batch sizes); otherwise the two-kernel path stands.
-            commit_view = getattr(ctx.token_to_kv_pool, "mla_fp8_commit_view", None)
-            view = (
-                commit_view(self.attn_mqa, out_cache_loc)
-                if commit_view is not None
-                else None
-            )
-            if view is not None and K is not None:
+            if K is not None:
+                # The pair is launch-latency bound at decode batch sizes, so
+                # fold the latent commit into the query assembly. Both MLA
+                # pools expose the same absolute-token-indexed latent buffer
+                # here, so the kernel can store into it directly.
                 Q = mla_nope_query_kv_fp8(
                     Q[..., : self.kv_lora_rank],
                     q_pe,
                     K,
-                    view,
+                    ctx.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id),
                     out_cache_loc,
                     sanitize=True,
                     enable_pdl=pdl_enabled(),
