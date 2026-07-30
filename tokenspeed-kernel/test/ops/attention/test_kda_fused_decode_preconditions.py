@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia, reason="CuTe DSL KDA decode is NVIDIA-only"
 )
 
-HV, K, V, D_FA = 4, 64, 64, 128
+HV, K, V, D_FA = 4, 128, 128, 128  # kernel is specialised for K=V=128
 P = HV * K
 
 
@@ -34,12 +34,12 @@ def _args(device: str, f_a: torch.Tensor, t: int = 1):
     idx = torch.arange(1, pages, device=device, dtype=torch.int32)
     return dict(
         qkv_raw=rnd(t, 3 * P),
-        conv_w=rnd(3 * P, 4, dtype=torch.float32).contiguous(),
+        conv_w=rnd(3 * P, 4).contiguous(),
         conv_pool=torch.zeros(pages, 3 * P, 3, dtype=torch.bfloat16, device=device),
         f_a=f_a,
-        w_fb=rnd(P, D_FA, dtype=torch.float32).contiguous(),
+        w_fb=rnd(P, D_FA).contiguous(),
         beta=rnd(t, HV),
-        A_log=rnd(P, dtype=torch.float32),
+        A_log=rnd(HV, dtype=torch.float32),
         dt_bias=rnd(P, dtype=torch.float32),
         h_pool=torch.zeros(pages, HV, K, K, dtype=torch.float32, device=device),
         read_indices=idx,

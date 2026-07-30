@@ -491,13 +491,6 @@ def fused_recurrent_kda_mtp(
     return out
 
 
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
-        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
-    }
-)
 # NOTE: the single-token decode megafusion that lived here was removed:
 # its in-place conv-window shift raced across the NV column-split
 # programs once the grid exceeded one co-resident wave (double-shifted
@@ -508,6 +501,7 @@ def fused_recurrent_kda_mtp(
 # per-position windows to its own scratch and does not share the race.
 
 
+@triton.heuristics({"USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None})
 @triton.jit
 def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     qkv_raw,  # [N*T, 3*P] pre-conv packed projections (token-strided)
