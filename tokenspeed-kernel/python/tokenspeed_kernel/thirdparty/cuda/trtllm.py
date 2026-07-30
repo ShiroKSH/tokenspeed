@@ -547,7 +547,12 @@ def trtllm_allreduce_fusion(
     if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
         # MNNVL-structured one-shot path: single NVLS multicast payload store,
         # local-buffer Lamport polling, same FusedOp epilogues.
-        assert workspace_ptrs.supports(
+        # RuntimeError, not assert: callers such as PrefillGraph catch
+        # RuntimeError to degrade to eager prefill, while an AssertionError
+        # escapes and kills every scheduler at startup. An assert would also
+        # vanish under `python -O`, letting an unsupported call reach the
+        # kernel.
+        if not workspace_ptrs.supports(
             token_num,
             hidden_dim,
             allreduce_in.dtype,
@@ -555,12 +560,13 @@ def trtllm_allreduce_fusion(
             pattern_code,
             use_oneshot=use_oneshot,
             residual_reduce_scattered=residual_reduce_scattered,
-        ), (
-            "mnnvl workspace does not support this call "
-            f"(token_num={token_num}, hidden_dim={hidden_dim}, "
-            f"dtype={allreduce_in.dtype}, pattern={pattern_code}, "
-            f"use_oneshot={use_oneshot})"
-        )
+        ):
+            raise RuntimeError(
+                "mnnvl workspace does not support this call "
+                f"(token_num={token_num}, hidden_dim={hidden_dim}, "
+                f"dtype={allreduce_in.dtype}, pattern={pattern_code}, "
+                f"use_oneshot={use_oneshot})"
+            )
         _load_trtllm_comm_module().trtllm_mnnvl_allreduce_fusion(
             allreduce_in,
             world_size,

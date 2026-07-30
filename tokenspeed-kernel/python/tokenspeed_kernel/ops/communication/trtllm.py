@@ -487,7 +487,7 @@ if current_platform().is_nvidia:
             hidden_dim=hidden_dim,
             workspace_ptrs=workspace,
             launch_with_pdl=launch_with_pdl,
-            use_oneshot=use_oneshot,
+            use_oneshot=resolved_oneshot,
             trigger_completion_at_end=trigger_completion_at_end,
             fp32_acc=fp32_acc,
             pattern_code=(pattern_code),
