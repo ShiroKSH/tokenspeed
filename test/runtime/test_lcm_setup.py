@@ -87,8 +87,8 @@ def test_qwen_recipe_returns_pool_spec_without_mutating_config() -> None:
         overlap_schedule_depth=0,
     )
 
-    assert server_args.block_size == 128
-    assert attn_config.page_size == 128
+    assert server_args.block_size == 64
+    assert attn_config.page_size == 64
     assert setup.draft is None
     assert setup.target.layer_group_ids == (
         f"{LINEAR_ATTENTION}_0",

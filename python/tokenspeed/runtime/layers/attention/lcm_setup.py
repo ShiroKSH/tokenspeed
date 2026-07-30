@@ -52,7 +52,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 
 LcmModelFamily = Literal["qwen_gdn", "inkling", "kimi_k3"]
 
-_LOGICAL_BLOCK_TOKENS = 64
+_DEFAULT_LOGICAL_BLOCK_TOKENS = 64
+_MXFP8_LOGICAL_BLOCK_TOKENS = 128
+_LOGICAL_BLOCK_TOKENS = _DEFAULT_LOGICAL_BLOCK_TOKENS
 _MAX_PADDING_FRACTION = 1.0
 
 
@@ -388,6 +390,15 @@ def _prepare_mha(
     draft_attn_config,
     cache_budget_bytes: int,
 ) -> LcmSetup:
+    global _LOGICAL_BLOCK_TOKENS
+    needs_mxfp8_scales = attn_config.kv_cache_mxfp8 or (
+        draft_attn_config is not None and draft_attn_config.kv_cache_mxfp8
+    )
+    _LOGICAL_BLOCK_TOKENS = (
+        _MXFP8_LOGICAL_BLOCK_TOKENS
+        if needs_mxfp8_scales
+        else _DEFAULT_LOGICAL_BLOCK_TOKENS
+    )
     if family == "qwen_gdn":
         if attn_config.kv_cache_mxfp8:
             raise RuntimeError(
@@ -588,14 +599,12 @@ def prepare_lcm_setup(
     overlap_schedule_depth: int,
 ) -> LcmSetup:
     """Apply one model recipe and size target/draft arenas from one budget."""
-    if server_args.block_size != _LOGICAL_BLOCK_TOKENS:
-        server_args.block_size = _LOGICAL_BLOCK_TOKENS
     attn_config.page_size = 64
     if draft_attn_config is not None:
         draft_attn_config.page_size = 64
 
     if family == "kimi_k3":
-        return _prepare_kimi_k3(
+        setup = _prepare_kimi_k3(
             server_args=server_args,
             model_config=model_config,
             attn_config=attn_config,
@@ -605,15 +614,18 @@ def prepare_lcm_setup(
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
         )
-    return _prepare_mha(
-        family=family,
-        server_args=server_args,
-        model_config=model_config,
-        attn_config=attn_config,
-        draft_model_config=draft_model_config,
-        draft_attn_config=draft_attn_config,
-        cache_budget_bytes=cache_budget_bytes,
-    )
+    else:
+        setup = _prepare_mha(
+            family=family,
+            server_args=server_args,
+            model_config=model_config,
+            attn_config=attn_config,
+            draft_model_config=draft_model_config,
+            draft_attn_config=draft_attn_config,
+            cache_budget_bytes=cache_budget_bytes,
+        )
+    server_args.block_size = setup.target.memory_plan.logical_block_tokens
+    return setup
 
 
 def create_lcm_pool(
