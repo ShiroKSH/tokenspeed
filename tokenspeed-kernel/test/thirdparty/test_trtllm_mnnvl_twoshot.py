@@ -51,9 +51,23 @@ def _world_size() -> int:
     return int(os.environ.get("WORLD_SIZE", "1"))
 
 
+def _supported_world_sizes() -> tuple[int, ...]:
+    """Derive the guard from the kernel's own list so the two cannot drift:
+    adding a world size to the kernel must not leave these tests silently
+    skipped (which reads as success -- pytest exits 0 either way)."""
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+            _MNNVL_SUPPORTED_WORLD_SIZES,
+        )
+
+        return tuple(_MNNVL_SUPPORTED_WORLD_SIZES)
+    except Exception:  # noqa: BLE001 -- kernel package unavailable
+        return (2, 4, 8)
+
+
 pytestmark = pytest.mark.skipif(
-    _world_size() not in {2, 4, 8},
-    reason="launch with torchrun world size 2, 4 or 8",
+    _world_size() not in _supported_world_sizes(),
+    reason=f"launch with torchrun world size in {_supported_world_sizes()}",
 )
 
 
