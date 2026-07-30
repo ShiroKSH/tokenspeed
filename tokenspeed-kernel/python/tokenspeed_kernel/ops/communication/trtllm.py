@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import logging
+import os
 
 import torch
 import torch.distributed as dist
@@ -183,17 +184,27 @@ if current_platform().is_nvidia:
                 return
 
             self.cleanup()
-            # allreduce_fusion, allgather_fusion, reducescatter_fusion all use the same workspace to create entry
-            self.ipc_handles, self.workspace_tensor = (
-                trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                    rank,
-                    world_size,
-                    max_token_num,
-                    hidden_dim,
-                    group=group,
-                    use_fp32_lamport=use_fp32_lamport,
+            # LOCAL PATCH (cross-node MNNVL test, 2026-07-30): CUDA-IPC handles
+            # cannot span nodes -- attempting creation on a cross-node group
+            # fails AND leaves a sticky CUDA context error (observed as
+            # 'invalid resource handle' on the next allocation). Gate it off
+            # for cross-node runs; the MNNVL fabric workspace below is the
+            # multi-node path.
+            _skip_ipc = os.getenv("TOKENSPEED_TRTLLM_AR_SKIP_IPC") == "1"
+            if _skip_ipc:
+                self.ipc_handles, self.workspace_tensor = None, None
+            else:
+                # allreduce_fusion, allgather_fusion, reducescatter_fusion all use the same workspace to create entry
+                self.ipc_handles, self.workspace_tensor = (
+                    trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                        rank,
+                        world_size,
+                        max_token_num,
+                        hidden_dim,
+                        group=group,
+                        use_fp32_lamport=use_fp32_lamport,
+                    )
                 )
-            )
             # Additionally arm the MNNVL one-shot AR workspace (NVLS multicast
             # + Lamport rotation). Capability auto-detected; the IPC workspace
             # above stays as the always-available fallback and continues to
@@ -201,6 +212,17 @@ if current_platform().is_nvidia:
             self.mnnvl_workspace = _try_create_mnnvl_workspace(
                 rank, world_size, max_token_num, hidden_dim, group
             )
+
+            # LOCAL PATCH: with IPC skipped, mnnvl is the only workspace; if it
+            # failed to arm there is nothing to fuse with -- stay uninitialized
+            # so prepare_allreduce_fusion() returns False and the model layer
+            # keeps the plain NCCL path.
+            if self.workspace_tensor is None and self.mnnvl_workspace is None:
+                logger.warning(
+                    "trtllm AR: no workspace available (ipc skipped, mnnvl "
+                    "failed); fusion disabled for this group"
+                )
+                return
 
             self.world_size = world_size
             self.rank = rank
@@ -324,6 +346,15 @@ if current_platform().is_nvidia:
             residual_reduce_scattered=residual_reduce_scattered,
         ):
             return mnnvl
+        # LOCAL PATCH: loud failure beats a silent None -- in cross-node test
+        # runs the IPC fallback does not exist, and any shape mnnvl rejects
+        # would otherwise reach the kernel with a null workspace.
+        if _workspace_manager.workspace_tensor is None:
+            raise RuntimeError(
+                f"trtllm AR fusion: shape (tokens={token_num}, hidden={hidden_dim}, "
+                f"dtype={dtype}, pattern={pattern_code}, oneshot={use_oneshot}) not "
+                "supported by mnnvl and no IPC fallback (TOKENSPEED_TRTLLM_AR_SKIP_IPC=1)"
+            )
         return _workspace_manager.workspace_tensor
 
     def get_num_tokens_per_rank(world_size: int, total_tokens_in_group: int) -> list:

@@ -1,3 +1,4 @@
+import os
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -94,16 +95,23 @@ class TrtllmAllReduceBackend(CommBackend):
 
             device_group = pg_manager.get_process_group("nccl", group)
 
-            ipc_handles, workspace_tensor = (
-                trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                    rank,
-                    len(group),
-                    max_token_num,
-                    hidden_dim,
-                    group=device_group,
-                    use_fp32_lamport=use_fp32_lamport,
+            # LOCAL PATCH (cross-node MNNVL test): see kernel-side note --
+            # CUDA-IPC cannot span nodes and a failed attempt poisons the
+            # CUDA context. Skip under the env gate; mnnvl below is the
+            # cross-node workspace.
+            if os.getenv("TOKENSPEED_TRTLLM_AR_SKIP_IPC") == "1":
+                ipc_handles, workspace_tensor = None, None
+            else:
+                ipc_handles, workspace_tensor = (
+                    trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                        rank,
+                        len(group),
+                        max_token_num,
+                        hidden_dim,
+                        group=device_group,
+                        use_fp32_lamport=use_fp32_lamport,
+                    )
                 )
-            )
 
             # NVLS variant for the plain one-shot path (capability-gated,
             # collective, symmetric fallback): the fused-pattern wrappers in
@@ -120,6 +128,11 @@ class TrtllmAllReduceBackend(CommBackend):
                 hidden_dim,
                 device_group,
             )
+
+            # LOCAL PATCH: nothing usable -> report failure so the backend
+            # keeps routing this group through NCCL.
+            if workspace_tensor is None and mnnvl_workspace is None:
+                return False
 
             self._resources[group] = {
                 "ipc_handles": ipc_handles,
@@ -239,6 +252,11 @@ class TrtllmAllReduceBackend(CommBackend):
             use_oneshot=True,
         ):
             workspace = mnnvl
+
+        # LOCAL PATCH: shape not covered by mnnvl and no IPC fallback -> let
+        # the caller fall back to NCCL (this function's None contract).
+        if workspace is None:
+            return None
 
         trtllm_allreduce_fusion(
             allreduce_in=tensor_2d,
