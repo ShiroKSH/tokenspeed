@@ -60,6 +60,7 @@ if current_platform().is_nvidia:
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         AllGatherFusionPattern,
         AllReduceFusionPattern,
+        _MNNVL_SUPPORTED_WORLD_SIZES,
         MNNVL_ONESHOT_MAX_TOKEN,
         MNNVL_PREFER_IPC_BYTES,
         ReduceScatterFusionPattern,
@@ -84,7 +85,11 @@ if current_platform().is_nvidia:
         NVLS multicast availability on this device. Purely local: safe to call
         before any collective.
         """
-        if world_size not in (2, 4, 8):
+        # Single source of truth: the kernel's own list. A duplicated literal
+        # here silently gated out world 16 even after the kernel gained it --
+        # the correctness suite passed (it calls the creator directly) while
+        # end-to-end serving found no workspace at all.
+        if world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
             return False
         try:
             if torch.cuda.get_device_capability()[0] < 9:
