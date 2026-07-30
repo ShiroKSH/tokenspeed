@@ -91,3 +91,64 @@ def test_fp8_decode_dispatches_with_native_fp8_query(monkeypatch):
     )
 
     assert captured["q"].dtype == torch.float8_e4m3fn
+
+
+def test_absorbed_extend_dispatches_with_packed_queries(monkeypatch):
+    captured = {}
+
+    def fake_mla_extend_with_kvcache(**kwargs):
+        captured.update(kwargs)
+        q = kwargs["q"]
+        return torch.zeros(q.shape[0], q.shape[1], 2)
+
+    monkeypatch.setattr(
+        mla_backend, "mla_extend_with_kvcache", fake_mla_extend_with_kvcache
+    )
+    backend = object.__new__(mla_backend.MLAAttnBackend)
+    backend.use_absorbed_extend = True
+    backend.forward_prefill_metadata = SimpleNamespace(
+        page_table=torch.tensor([[0], [1]], dtype=torch.int32),
+        seq_lens=torch.tensor([3, 7], dtype=torch.int32),
+        cum_extend_seq_lens=torch.tensor([0, 3, 5], dtype=torch.int32),
+        cum_seq_lens_kv=torch.tensor([0, 3, 10], dtype=torch.int32),
+        max_extend_seq_len=3,
+    )
+    backend.data_type = torch.bfloat16
+    backend.page_size = 64
+    backend.kv_cache_dim = 4
+    backend.max_context_len = 128
+    backend.qk_nope_head_dim = 2
+    backend.kv_lora_rank = 2
+    backend.qk_rope_head_dim = 2
+    backend.kernel_solution = None
+
+    layer = SimpleNamespace(
+        tp_q_head_num=1,
+        head_dim=4,
+        v_head_dim=2,
+        scaling=1.0,
+        logit_cap=0.0,
+        layer_id=0,
+    )
+    token_to_kv_pool = SimpleNamespace(
+        get_key_buffer=lambda layer_id: torch.zeros(
+            2 * backend.page_size, backend.kv_cache_dim, dtype=torch.bfloat16
+        )
+    )
+
+    output = backend.forward_extend(
+        q=torch.zeros(5, 1, 4, dtype=torch.bfloat16),
+        k=None,
+        v=None,
+        layer=layer,
+        out_cache_loc=torch.empty(0, dtype=torch.int32),
+        token_to_kv_pool=token_to_kv_pool,
+        bs=2,
+        save_kv_cache=False,
+    )
+
+    assert output.shape == (5, 2)
+    assert captured["q"].shape == (5, 1, 4)
+    assert captured["cache_seqlens"].tolist() == [3, 7]
+    assert captured["cu_seqlens_q"].tolist() == [0, 3, 5]
+    assert captured["cu_seqlens_kv"].tolist() == [0, 3, 10]
