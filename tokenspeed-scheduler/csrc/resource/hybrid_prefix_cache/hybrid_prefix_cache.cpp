@@ -42,12 +42,6 @@
 namespace tokenspeed {
 namespace {
 
-#if TOKENSPEED_FLAT_KVCACHE
-constexpr bool kFlatOwnsPageAllocation = true;
-#else
-constexpr bool kFlatOwnsPageAllocation = false;
-#endif
-
 const TreeNode* FindExactRadixNode(const KVPrefixCache& cache,
                                    std::span<const std::span<const std::int32_t>> token_pages,
                                    std::int32_t target_raw_tokens) {
@@ -1394,15 +1388,6 @@ bool HybridPrefixCache::admitPagedCacheChunk(const std::string& request_id, std:
                                              std::map<std::string, std::int32_t>& simulated_free,
                                              const MatchResult::PagedCache& paged_cache_hit,
                                              const PagedCacheAdmissionContext& context) {
-    if (kFlatOwnsPageAllocation) {
-        // The flat coordinator owns page allocation for every cache group, so
-        // these adjunct allocators never hand out pages and a request never
-        // gets an adjunct page table. The demand below is derived from the whole
-        // history while the accounted total stays zero, so it grows past the
-        // pool and starves the request permanently once the history exceeds
-        // pool_pages * tokens_per_page. Flat admission already bounds capacity.
-        return true;
-    }
     PagedCacheGroupAdmission admission = checkPagedCacheGroupAdmission(
         request_id, first_raw_position_of_op, target_raw_tokens_exclusive, simulated_free, paged_cache_hit, context);
     const std::size_t prune_budget = paged_cache_snapshot_nodes_.size();
