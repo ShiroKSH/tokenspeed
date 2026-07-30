@@ -497,8 +497,12 @@ cudaError_t mnnvl_allreduce_fusion_op(AllReduceFusionParams<T> const& params,
     case 8:
       MNNVL_DISPATCH_PATTERN(8);
       break;
+    case 16:
+      MNNVL_DISPATCH_PATTERN(16);
+      break;
     default:
-      FLASHINFER_ERROR("mnnvl allreduce fusion: unsupported world size (supported: 2, 4, 8)");
+      FLASHINFER_ERROR(
+          "mnnvl allreduce fusion: unsupported world size (supported: 2, 4, 8, 16)");
   }
 #undef MNNVL_DISPATCH_PATTERN
   return cudaErrorInvalidValue;

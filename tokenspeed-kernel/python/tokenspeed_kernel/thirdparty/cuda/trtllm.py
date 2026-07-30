@@ -260,7 +260,9 @@ _MNNVL_SUPPORTED_PATTERNS = frozenset(
     }
 )
 
-_MNNVL_SUPPORTED_WORLD_SIZES = (2, 4, 8)
+# 16 covers 4-node TP16 (Kimi-K3); the NVLink domain spans the rack, so the
+# limit was template instantiation, not fabric reach.
+_MNNVL_SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
 
 
 def _mnnvl_grid_config_ok(hidden_dim: int, elem_size: int) -> bool:
