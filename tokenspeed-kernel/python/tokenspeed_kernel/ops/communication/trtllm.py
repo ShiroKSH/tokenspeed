@@ -61,6 +61,7 @@ if current_platform().is_nvidia:
         AllGatherFusionPattern,
         AllReduceFusionPattern,
         MNNVL_ONESHOT_MAX_TOKEN,
+        MNNVL_PREFER_IPC_BYTES,
         ReduceScatterFusionPattern,
         _ar_should_use_oneshot,
         _load_trtllm_comm_module,
@@ -150,6 +151,39 @@ if current_platform().is_nvidia:
         )
         return workspace
 
+    def _group_spans_nodes(group) -> bool:
+        """True when the process group spans hosts.
+
+        CUDA-IPC handles cannot cross a node boundary, and a failed creation
+        attempt does not merely fail -- it leaves a sticky CUDA context error
+        that kills the next allocation. So this must be decided before trying,
+        not caught afterwards.
+        """
+        import socket
+
+        try:
+            world = (
+                dist.get_world_size(group)
+                if group is not None
+                else dist.get_world_size()
+            )
+            names = [None] * world
+            dist.all_gather_object(names, socket.gethostname(), group=group)
+            return len(set(names)) > 1
+        except Exception:  # noqa: BLE001 -- no distributed context: single node
+            return False
+
+    def _skip_ipc_workspace(group) -> bool:
+        """Whether to skip arming the CUDA-IPC workspace for *group*.
+
+        Auto-detected so a cross-node run is safe by default;
+        TOKENSPEED_TRTLLM_AR_SKIP_IPC=0/1 forces the decision.
+        """
+        override = os.getenv("TOKENSPEED_TRTLLM_AR_SKIP_IPC")
+        if override is not None:
+            return override == "1"
+        return _group_spans_nodes(group)
+
     class TrtllmFusionWorkspaceManager:
         def __init__(self):
             self.workspace_tensor = None
@@ -191,7 +225,7 @@ if current_platform().is_nvidia:
             # 'invalid resource handle' on the next allocation). Gate it off
             # for cross-node runs; the MNNVL fabric workspace below is the
             # multi-node path.
-            _skip_ipc = os.getenv("TOKENSPEED_TRTLLM_AR_SKIP_IPC") == "1"
+            _skip_ipc = _skip_ipc_workspace(group)
             if _skip_ipc:
                 self.ipc_handles, self.workspace_tensor = None, None
             else:
@@ -337,6 +371,16 @@ if current_platform().is_nvidia:
     ):
         """Pick the AR workspace for one call: mnnvl when eligible, else IPC."""
         mnnvl = _workspace_manager.mnnvl_workspace
+        # Byte-based split between the two fused workspaces: multicast (mnnvl)
+        # for small payloads, IPC lamport once bandwidth dominates. Only bites
+        # single-node -- cross-node workspace_tensor is None and mnnvl is the
+        # only option. See MNNVL_PREFER_IPC_BYTES for the measurement.
+        payload_bytes = token_num * hidden_dim * dtype.itemsize
+        if (
+            _workspace_manager.workspace_tensor is not None
+            and payload_bytes >= MNNVL_PREFER_IPC_BYTES
+        ):
+            return _workspace_manager.workspace_tensor
         if mnnvl is not None and mnnvl.supports(
             token_num,
             hidden_dim,

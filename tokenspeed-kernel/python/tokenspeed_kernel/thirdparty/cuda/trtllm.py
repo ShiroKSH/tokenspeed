@@ -249,6 +249,17 @@ MNNVL_ONESHOT_MAX_TOKEN = 128
 # kernel header. Workspace slot layout: [A: token][rank][hidden] + [B: token][hidden].
 MNNVL_TWOSHOT_MAX_TOKEN = 2048
 
+# Above this payload the IPC lamport workspace beats the mnnvl multicast one on
+# a single node: multicast wins while the cost is dominated by the number of
+# stores, but past a few MiB the cost is bandwidth and IPC's direct peer writes
+# come out ahead. Measured at world 4, hidden 7168, bf16: mnnvl leads through
+# 384 tokens (5.25 MiB) and trails from 512 (7.00 MiB) -- 216 vs 128 us at 2048.
+# Expressed in bytes of the input tensor so it holds across hidden sizes and
+# dtypes. Only reachable single-node: cross-node there is no IPC workspace.
+MNNVL_PREFER_IPC_BYTES = int(
+    os.environ.get("TOKENSPEED_MNNVL_PREFER_IPC_BYTES", 6 * 1024 * 1024)
+)
+
 _MNNVL_SUPPORTED_PATTERNS = frozenset(
     {
         AllReduceFusionPattern.kAllReduce,

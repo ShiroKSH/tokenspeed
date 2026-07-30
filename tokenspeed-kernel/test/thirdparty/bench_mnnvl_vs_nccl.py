@@ -46,8 +46,14 @@ import torch.distributed as dist
 
 H, EPS = 7168, 1e-6
 MAXTOK = 2048
-TOKENS = [1, 2, 4, 8, 16, 32, 64, 128, 129, 192, 256, 384, 512, 768, 1024, 1536, 2048]
-WARMUP, ITERS = 10, 50
+TOKENS = [
+    int(t)
+    for t in os.environ.get(
+        "BENCH_TOKENS",
+        "1,2,4,8,16,32,64,128,129,192,256,384,512,768,1024,1536,2048",
+    ).split(",")
+]
+WARMUP, ITERS = int(os.environ.get("BENCH_WARMUP", 10)), int(os.environ.get("BENCH_ITERS", 50))
 
 
 def _spans_nodes() -> bool:

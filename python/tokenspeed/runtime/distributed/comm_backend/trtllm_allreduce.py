@@ -99,7 +99,11 @@ class TrtllmAllReduceBackend(CommBackend):
             # CUDA-IPC cannot span nodes and a failed attempt poisons the
             # CUDA context. Skip under the env gate; mnnvl below is the
             # cross-node workspace.
-            if os.getenv("TOKENSPEED_TRTLLM_AR_SKIP_IPC") == "1":
+            from tokenspeed_kernel.ops.communication.trtllm import (
+                _skip_ipc_workspace,
+            )
+
+            if _skip_ipc_workspace(device_group):
                 ipc_handles, workspace_tensor = None, None
             else:
                 ipc_handles, workspace_tensor = (
