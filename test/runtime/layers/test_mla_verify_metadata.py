@@ -112,6 +112,7 @@ def test_absorbed_extend_dispatches_with_packed_queries(monkeypatch):
         cum_extend_seq_lens=torch.tensor([0, 3, 5], dtype=torch.int32),
         cum_seq_lens_kv=torch.tensor([0, 3, 10], dtype=torch.int32),
         max_extend_seq_len=3,
+        max_extend_prefix_len=5,
     )
     backend.data_type = torch.bfloat16
     backend.page_size = 64
@@ -152,3 +153,76 @@ def test_absorbed_extend_dispatches_with_packed_queries(monkeypatch):
     assert captured["cache_seqlens"].tolist() == [3, 7]
     assert captured["cu_seqlens_q"].tolist() == [0, 3, 5]
     assert captured["cu_seqlens_kv"].tolist() == [0, 3, 10]
+
+
+def test_prefix_free_extend_dispatches_to_expanded_prefill(monkeypatch):
+    captured = {}
+
+    def fake_mla_prefill(**kwargs):
+        captured.update(kwargs)
+        q = kwargs["q"]
+        return torch.zeros(q.shape[0], q.shape[1], 2)
+
+    monkeypatch.setattr(mla_backend, "mla_prefill", fake_mla_prefill)
+    backend = object.__new__(mla_backend.MLAAttnBackend)
+    backend.use_absorbed_extend = True
+    backend.forward_prefill_metadata = SimpleNamespace(
+        cum_extend_seq_lens=torch.tensor([0, 3], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3], dtype=torch.int32),
+        max_extend_seq_len=3,
+        max_extend_prefix_len=0,
+    )
+    backend.kernel_solution = None
+
+    layer = SimpleNamespace(
+        tp_q_head_num=1,
+        tp_k_head_num=1,
+        tp_v_head_num=1,
+        qk_head_dim=4,
+        v_head_dim=2,
+        scaling=1.0,
+        logit_cap=0.0,
+    )
+
+    output = backend.forward_extend(
+        q=torch.zeros(3, 1, 4),
+        k=torch.zeros(3, 1, 4),
+        v=torch.zeros(3, 1, 2),
+        layer=layer,
+        out_cache_loc=torch.empty(0, dtype=torch.int32),
+        token_to_kv_pool=None,
+        bs=1,
+        save_kv_cache=False,
+    )
+
+    assert output.shape == (3, 2)
+    assert captured["cu_seqlens_q"].tolist() == [0, 3]
+    assert captured["cu_seqlens_kv"].tolist() == [0, 3]
+
+
+def test_prefix_free_metadata_omits_absorbed_cache_tables(monkeypatch):
+    monkeypatch.setattr(
+        mla_backend,
+        "build_chunked_prefill_metadata_arrays",
+        lambda *args: (0, [], torch.empty(0), torch.empty(0), []),
+    )
+    backend = object.__new__(mla_backend.MLAAttnBackend)
+    backend.device = "cpu"
+    backend.use_absorbed_extend = True
+    backend.page_size = 64
+    backend.max_context_len = 128
+
+    backend._init_prefill_metadata(
+        seq_lens=torch.tensor([3], dtype=torch.int32),
+        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+        req_to_page=torch.zeros((1, 2), dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+        extend_prefix_lens_cpu=torch.tensor([0], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3], dtype=torch.int32),
+        extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+    )
+
+    metadata = backend.forward_prefill_metadata
+    assert metadata is not None
+    assert metadata.cum_seq_lens_kv is None
+    assert metadata.page_table is None

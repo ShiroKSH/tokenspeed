@@ -731,8 +731,11 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
+            # Initial prefill has no cached prefix and stays on expanded Q/K/V.
+            # Absorb only cached-prefix extend so it can consume compact KV pages.
             if (
                 getattr(ctx.attn_backend, "use_absorbed_extend", False)
+                and cmeta.max_extend_prefix_len > 0
                 and self.attn_mqa.logit_cap == 0.0
             ):
                 self.forward_absorb(
