@@ -60,6 +60,7 @@ if current_platform().is_nvidia:
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         AllGatherFusionPattern,
         AllReduceFusionPattern,
+        MNNVL_ONESHOT_MAX_TOKEN,
         ReduceScatterFusionPattern,
         _ar_should_use_oneshot,
         _load_trtllm_comm_module,
@@ -455,6 +456,20 @@ if current_platform().is_nvidia:
                 token_num, hidden_dim, input_tensor.dtype, world_size
             )
         )
+        # The size heuristic above encodes the IPC-lamport crossover in BYTES,
+        # while the mnnvl one-shot kernel is capped in TOKENS
+        # (MNNVL_ONESHOT_MAX_TOKEN). They disagree: at world=8 the 42 MB
+        # threshold lands on 192 tokens, which one-shot mnnvl cannot serve, and
+        # cross-node there is no IPC workspace to fall back to. Respect the
+        # kernel's own cap so such shapes take the two-shot path instead.
+        if (
+            resolved_oneshot
+            and token_num > MNNVL_ONESHOT_MAX_TOKEN
+            and _workspace_manager.mnnvl_workspace is not None
+            and _workspace_manager.workspace_tensor is None
+        ):
+            resolved_oneshot = False
+
         workspace = _ar_fusion_workspace(
             token_num,
             hidden_dim,
