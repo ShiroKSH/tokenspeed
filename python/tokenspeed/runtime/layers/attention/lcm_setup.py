@@ -52,7 +52,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 
 LcmModelFamily = Literal["qwen_gdn", "inkling", "kimi_k3"]
 
-_LOGICAL_BLOCK_TOKENS = 128
+_LOGICAL_BLOCK_TOKENS = 64
 _MAX_PADDING_FRACTION = 1.0
 
 
