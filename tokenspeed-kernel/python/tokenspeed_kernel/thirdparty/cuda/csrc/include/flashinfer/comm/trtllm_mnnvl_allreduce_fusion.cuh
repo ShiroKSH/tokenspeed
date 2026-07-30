@@ -57,6 +57,9 @@ using trtllm_allreduce_fusion::details::kBytesPerAccess;
 // Mirror of the vendored one-shot cap: the MNNVL path is a decode-latency
 // kernel; larger payloads use the lamport/twoshot fallback.
 static constexpr int kMnnvlOneShotMaxToken = 128;
+// Two-shot serves the prefill-sized calls one-shot cannot; bounded by the
+// workspace allocation (token_num * (NRanks+1) * hidden * elem * 3 rotations).
+static constexpr int kMnnvlTwoShotMaxToken = 2048;
 static constexpr int kMaxClusterSize = 8;
 }  // namespace details
 
@@ -233,6 +236,115 @@ __global__ void __launch_bounds__(1024)
 #endif
 }
 
+// Two-shot MNNVL allreduce with the vendored FusedOp epilogue.
+//
+// Token-sharded: rank r owns tokens [r*shard, (r+1)*shard). Every rank still
+// launches one cluster per token (same geometry as one-shot) because every
+// rank needs every token's epilogue output locally.
+//
+//   phase A: all ranks multicast-store their input slot [token][rank][hidden]
+//            (same staging layout as one-shot);
+//   reduce : ONLY the owner cluster polls the NRanks slots of its token and
+//            reduces -- reduce work per rank drops NRanks-fold vs one-shot;
+//   phase B: the owner multicast-stores the REDUCED (pre-epilogue) vector to
+//            the B region [token][hidden] appended after the A region;
+//   land   : non-owner clusters poll their token's B slot;
+//   epilog : every rank runs the identical FusedOp on identical sum bits --
+//            bitwise-deterministic, so norm/residual outputs match everywhere
+//            without shipping two result arrays.
+//
+// Buffer per rotation slot: token_num * (NRanks + 1) * hidden * sizeof(T)
+// (A region + B region); the host sizes bytes_per_buffer accordingly.
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc,
+          bool TriggerCompletionAtEnd = true>
+__global__ void __launch_bounds__(1024)
+    mnnvl_allreduce_fusion_kernel_twoshot(AllReduceFusionParams<T> params, MnnvlCommArgs comm) {
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  namespace cg = cooperative_groups;
+  cg::cluster_group cluster = cg::this_cluster();
+  int const token_id = blockIdx.x;
+  int const num_tokens = gridDim.x;
+  int const packed_idx = cluster.thread_rank();
+  int const token_dim = params.hidden_dim;
+  int const access_id = token_id * (token_dim / VEC_SIZE) + packed_idx;
+  int const shard = (num_tokens + NRanks - 1) / NRanks;
+  int const owner = token_id / shard;
+  bool const is_owner = (owner == params.rank);
+  FusedOp<Pattern, T> fused_op(params, access_id, packed_idx);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+  fused_op.load_upstream_inputs();
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (!TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+
+  MnnvlLamportFlags flags(comm.buffer_flags);
+  T* stage_mcast = reinterpret_cast<T*>(flags.current_buf(comm.multicast_ptr));
+  T* stage_local = reinterpret_cast<T*>(flags.current_buf(comm.buffer_ptr_local));
+  // B region sits after the full A region.
+  size_t const b_region = static_cast<size_t>(num_tokens) * NRanks * token_dim;
+
+  // ============ phase A: broadcast the local input slot ===================
+  vec_t<T, VEC_SIZE> val;
+  val.load(reinterpret_cast<T*>(params.allreduce_in) + static_cast<size_t>(access_id) * VEC_SIZE);
+  remove_neg_zero<T, VEC_SIZE>(val);
+  size_t const slot_base = (static_cast<size_t>(token_id) * NRanks + params.rank) *
+                               static_cast<size_t>(token_dim) +
+                           static_cast<size_t>(packed_idx) * VEC_SIZE;
+  val.store(stage_mcast + slot_base);
+
+  size_t const b_slot =
+      b_region + static_cast<size_t>(token_id) * token_dim + static_cast<size_t>(packed_idx) * VEC_SIZE;
+  vec_t<T, VEC_SIZE> sum_val;
+  if (is_owner) {
+    // ============ owner: poll A slots, reduce, publish to B ================
+    vec_t<T, VEC_SIZE> vals[NRanks];
+    bool done = false;
+    while (!done) {
+      done = true;
+#pragma unroll
+      for (int r = 0; r < NRanks; ++r) {
+        vals[r].load_global_volatile(stage_local +
+                                     (static_cast<size_t>(token_id) * NRanks + r) *
+                                         static_cast<size_t>(token_dim) +
+                                     static_cast<size_t>(packed_idx) * VEC_SIZE);
+        done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
+      }
+    }
+    sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
+    // -0.0 payloads would deadlock the non-owner poll; scrub like the input.
+    remove_neg_zero<T, VEC_SIZE>(sum_val);
+    sum_val.store(stage_mcast + b_slot);
+    flags.cta_arrive();
+    flags.clear_dirty(comm.buffer_ptr_local);
+  } else {
+    flags.cta_arrive();
+    flags.clear_dirty(comm.buffer_ptr_local);
+    // ============ non-owner: land the reduced vector from B ================
+    bool done = false;
+    while (!done) {
+      sum_val.load_global_volatile(stage_local + b_slot);
+      done = !has_neg_zero<T, VEC_SIZE>(sum_val);
+    }
+  }
+
+  // ============ identical epilogue on identical bits ======================
+  fused_op(sum_val, token_id, /*skip_residual_add=*/false, /*skip_residual_store=*/false,
+           /*skip_partial_store=*/true, access_id, access_id);
+
+  flags.wait_and_update(static_cast<uint32_t>(static_cast<size_t>(num_tokens) * (NRanks + 1) *
+                                              static_cast<size_t>(token_dim) * sizeof(T)));
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+}
+
 // Pick (block_size, cluster_size) such that block_size * cluster_size ==
 // hidden_dim / VEC_SIZE exactly (FusedOp's block reductions require full
 // participation and whole warps). Returns {-1, -1} when no exact partition
@@ -281,6 +393,21 @@ cudaError_t mnnvl_launch_oneshot(AllReduceFusionParams<T> const& params, MnnvlCo
   return cudaSuccess;
 }
 
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
+cudaError_t mnnvl_launch_twoshot(AllReduceFusionParams<T> const& params, MnnvlCommArgs const& comm,
+                                 cudaLaunchConfig_t& cfg) {
+  if (params.trigger_completion_at_end) {
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+        &cfg, mnnvl_allreduce_fusion_kernel_twoshot<Pattern, T, NRanks, Fp32Acc, true>, params,
+        comm));
+  } else {
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+        &cfg, mnnvl_allreduce_fusion_kernel_twoshot<Pattern, T, NRanks, Fp32Acc, false>, params,
+        comm));
+  }
+  return cudaSuccess;
+}
+
 template <AllReduceFusionPattern Pattern, typename T, int NRanks>
 cudaError_t mnnvl_allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& params,
                                                    MnnvlCommArgs const& comm, bool launch_with_pdl,
@@ -288,8 +415,9 @@ cudaError_t mnnvl_allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> cons
   static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
   FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "params.size % params.hidden_dim != 0");
   int token_num = params.size / params.hidden_dim;
-  FLASHINFER_CHECK(token_num <= details::kMnnvlOneShotMaxToken,
-                   "mnnvl oneshot supports at most ", details::kMnnvlOneShotMaxToken, " tokens");
+  bool const use_twoshot = token_num > details::kMnnvlOneShotMaxToken;
+  FLASHINFER_CHECK(token_num <= details::kMnnvlTwoShotMaxToken,
+                   "mnnvl allreduce supports at most ", details::kMnnvlTwoShotMaxToken, " tokens");
   static int SM = trtllm_allreduce_fusion::utils::getSMVersion();
   FLASHINFER_CHECK(SM >= 90, "mnnvl allreduce fusion requires SM90+");
   auto [block_size, cluster_size] =
@@ -312,6 +440,14 @@ cudaError_t mnnvl_allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> cons
   cfg.attrs = attrs;
   cfg.numAttrs = 2;
 
+  if (use_twoshot) {
+    if constexpr (!std::is_same_v<T, float>) {
+      if (fp32_acc) {
+        return mnnvl_launch_twoshot<Pattern, T, NRanks, true>(params, comm, cfg);
+      }
+    }
+    return mnnvl_launch_twoshot<Pattern, T, NRanks, false>(params, comm, cfg);
+  }
   if constexpr (!std::is_same_v<T, float>) {
     if (fp32_acc) {
       return mnnvl_launch_oneshot<Pattern, T, NRanks, true>(params, comm, cfg);

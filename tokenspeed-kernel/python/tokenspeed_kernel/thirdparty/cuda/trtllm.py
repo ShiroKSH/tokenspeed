@@ -28,6 +28,7 @@ Usage:
 
 import functools
 import logging
+import os
 from ctypes import c_void_p, cast
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -244,6 +245,9 @@ def _destroy_ipc_workspace(
 # IPC lamport/twoshot fallback, so the workspace is sized (and clamped) for
 # this many tokens at most.
 MNNVL_ONESHOT_MAX_TOKEN = 128
+# Two-shot serves 129..2048-token calls; mirrors kMnnvlTwoShotMaxToken in the
+# kernel header. Workspace slot layout: [A: token][rank][hidden] + [B: token][hidden].
+MNNVL_TWOSHOT_MAX_TOKEN = 2048
 
 _MNNVL_SUPPORTED_PATTERNS = frozenset(
     {
@@ -332,17 +336,21 @@ class MnnvlAllReduceFusionWorkspace:
             True when the mnnvl path can serve the call; callers must fall
             back to the IPC lamport workspace otherwise.
         """
-        if not use_oneshot or residual_reduce_scattered:
+        if residual_reduce_scattered:
             return False
+        # two-shot (use_oneshot=False) is served by the twoshot kernel up to
+        # MNNVL_TWOSHOT_MAX_TOKEN, provided the workspace was sized for it.
         if world_size != self.tp_size or world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
             return False
         if dtype not in (torch.bfloat16, torch.float16):
             return False
         if pattern_code not in _MNNVL_SUPPORTED_PATTERNS:
             return False
-        if token_num > MNNVL_ONESHOT_MAX_TOKEN:
+        cap = MNNVL_ONESHOT_MAX_TOKEN if use_oneshot else MNNVL_TWOSHOT_MAX_TOKEN
+        if token_num > cap:
             return False
-        payload = token_num * hidden_dim * world_size * dtype.itemsize
+        # (world_size + 1) covers the two-shot A+B layout; conservative for one-shot.
+        payload = token_num * hidden_dim * (world_size + 1) * dtype.itemsize
         if payload > self.buffer_size_bytes:
             return False
         return _mnnvl_grid_config_ok(hidden_dim, dtype.itemsize)
@@ -380,9 +388,13 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
         raise RuntimeError(f"mnnvl workspace: unsupported tp_size {tp_size}")
 
     device = torch.device("cuda", torch.cuda.current_device())
-    oneshot_max_token = min(max_token_num, MNNVL_ONESHOT_MAX_TOKEN)
+    # Size for the largest path the caller may use: one-shot needs
+    # token*rank*hidden; two-shot appends a [token][hidden] B region, i.e.
+    # (rank+1) lanes. Callers asking for <=128 tokens get the old footprint.
+    ws_max_token = min(max_token_num, MNNVL_TWOSHOT_MAX_TOKEN)
+    lanes = tp_size + (1 if ws_max_token > MNNVL_ONESHOT_MAX_TOKEN else 0)
     bytes_per_buffer = _round_up(
-        oneshot_max_token * hidden_dim * tp_size * dtype_elem_size, 16
+        ws_max_token * hidden_dim * lanes * dtype_elem_size, 16
     )
     total_bytes = 3 * bytes_per_buffer
 
@@ -417,7 +429,7 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
     return MnnvlAllReduceFusionWorkspace(
         tp_rank=tp_rank,
         tp_size=tp_size,
-        max_token_num=oneshot_max_token,
+        max_token_num=ws_max_token,
         hidden_dim=hidden_dim,
         buffer_size_bytes=buffer_size_bytes,
         multicast_ptr=int(multicast_ptr),
